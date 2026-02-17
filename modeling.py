@@ -1,4 +1,4 @@
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -201,11 +201,15 @@ class EFLayoutSpatialModel(nn.Module):
 class EFLayoutGraphBlock(nn.Module):
     def __init__(self, config: EFLayoutGraphConfig, layer_idx: int):
         super().__init__()
+        self.edge_dim = None
+        if config.edge_dim > 0:
+            self.edge_dim = config.edge_dim
         if layer_idx == 0:
             self.attn = GATv2Conv(
                 config.state_dim + config.type_dim,
                 config.hidden_size,
                 heads=config.num_heads,
+                edge_dim=self.edge_dim,
                 dropout=config.dropout,
                 residual=True,
                 concat=True
@@ -216,14 +220,22 @@ class EFLayoutGraphBlock(nn.Module):
                 dim,
                 dim,
                 heads=config.num_heads,
+                edge_dim=self.edge_dim,
                 dropout=config.dropout,
                 residual=True,
                 concat=False
             )
         self.config = config
     
-    def forward(self, hidden_states: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        return F.elu(self.attn(hidden_states, edge_index))
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attrs: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if edge_attrs is not None:
+            assert self.edge_dim is not None, f"edge_dim is None, unexpected edge_attrs={edge_attrs}"
+        return F.elu(self.attn(hidden_states, edge_index, edge_attr=edge_attrs))
 
 
 class EFLayoutGraphModel(nn.Module):
@@ -236,12 +248,17 @@ class EFLayoutGraphModel(nn.Module):
         ])
         self.out_proj = nn.Linear(config.num_heads * config.hidden_size, config.output_dim)
 
-    def forward(self, graph_nodes: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        graph_nodes: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attrs: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         type_emb = self.type_emb(graph_nodes[:, 0])
         hidden_states = torch.cat([type_emb, graph_nodes[:, 1:]], dim=1)
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, edge_index)
+            hidden_states = block(hidden_states, edge_index, edge_attrs)
 
         hidden_states = self.out_proj(hidden_states)
         return hidden_states
@@ -271,14 +288,16 @@ class EFLayoutModelBackbone(nn.Module):
 
     def forward(
         self,
-        spatial_info:  Dict[str, torch.Tensor],
+        spatial_info: Dict[str, torch.Tensor],
         spatial_hw: torch.Tensor, # (B, 2)
         graph_nodes: torch.Tensor, # (sum N_n, D_g)
         edge_index: torch.Tensor, # (2, sum N_e)
         node_lengths: torch.Tensor, # (B)
+        edge_attrs: Optional[torch.Tensor] = None, # (sum N_e, D_e)
+        **kwargs,
     ):
         spatial_embeds = self.spatial(spatial_info, spatial_hw)
-        graph_embeds = self.graph(graph_nodes, edge_index)
+        graph_embeds = self.graph(graph_nodes, edge_index, edge_attrs)
         
         spatial = self.spatial_proj(spatial_embeds)
         graph = self.graph_proj(graph_embeds)

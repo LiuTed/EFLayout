@@ -20,6 +20,7 @@ class EFLayoutGraphConfig:
     type_dim: int
     state_dim: int
     output_dim: int
+    edge_dim: int
     hidden_size: int
     num_heads: int
     dropout: float
