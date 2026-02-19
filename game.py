@@ -1,3 +1,6 @@
+import random
+import os
+import yaml
 from enum import Enum, auto
 from dataclasses import dataclass
 from typing import Sequence, Union, Optional, Any, Dict
@@ -9,13 +12,18 @@ import torch
 class Channels(Enum):
     MachineType = auto()
     MachineId = auto()
+    PortDirection = auto()
+    ConnectedUp = auto()
+    ConnectedRight = auto()
+    # model features starts here
     Placed = auto()
     IsBelt = auto()
     IsMachine = auto()
     IsPower = auto()
-    MachineDirection = auto()
     InputPort = auto()
     OutputPort = auto()
+    PortUp = auto()
+    PortRight = auto()
     Powered = auto()
     BeltRight = auto()
     BeltUp = auto()
@@ -30,46 +38,117 @@ class Directions(Enum):
     Left = auto()
 
 @dataclass
+class GraphNode:
+    MachineType: int
+
+@dataclass
+class GraphEdge:
+    Source: int
+    Dest: int
+    Weight: int
+    Optional: bool = False
+
+@dataclass
 class Graph:
-    Nodes: Sequence[int]
-    Edges: Sequence[Sequence[int]]
+    Nodes: Sequence[GraphNode]
+    Edges: Sequence[GraphEdge]
 
 class NodeAttrs(Enum):
+    Id = auto()
     MachineType = auto()
+    # model features starts here
     Placed = auto()
     Powered = auto()
+    Source = auto()
+    Sink = auto()
     Num = auto()
+
+class EdgeAttrs(Enum):
+    Abstract = auto()
+    Weight = auto()
+    Connected = auto()
+    Optional = auto()
+    Num = auto()
+
 
 RevDirections = [Directions.Down, Directions.Left, Directions.Up, Directions.Right]
 DirectionDxDy = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+DefaultInputs = {
+    (3, 3): ((2, 0), (2, 1), (2, 2)),
+    (5, 5): ((4, 0), (4, 1), (4, 2), (4, 3), (4, 4)),
+    (3, 6): ((2, 0), (2, 1), (2, 2), (2, 3), (2, 4), (2, 5)),
+}
+DefaultOutputs = {
+    (3, 3): ((0, 0), (0, 1), (0, 2)),
+    (5, 5): ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4)),
+    (3, 6): ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5)),
+}
 
-Default33Inputs = ((2, 0), (2, 1), (2, 2))
-Default33Outputs = ((0, 0), (0, 1), (0, 2))
-Default35Inputs = ((2, 0), (2, 1), (2, 2), (2, 3), (2, 4))
-Default35Outputs = ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4))
-Default55Inputs = ((4, 0), (4, 1), (4, 2), (4, 3), (4, 4))
-Default55Outputs = ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4))
-Default36Inputs = ((2, 0), (2, 1), (2, 2), (2, 3), (2, 4), (2, 5))
-Default36Outputs = ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5))
-Machines = [
-    ('Jinglian', 3, 3, Default33Inputs, Default33Outputs),
-    ('Fensui', 3, 3, Default33Inputs, Default33Outputs),
-    ('Fengzhuang', 3, 5, Default35Inputs, Default35Outputs),
-    ('Zhongzhi', 5, 5, Default55Inputs, Default55Outputs),
-    ('Caizhong', 5, 5, Default55Inputs, Default55Outputs),
-]
+with open(os.path.join(os.path.dirname(__file__), 'game_config.yaml'), 'r') as f:
+    _config = yaml.safe_load(f)
+    Machines = _config['machines']
+    NameToMachine = {}
+    for i, m in enumerate(Machines):
+        if 'inputs' not in m:
+            m['inputs'] = DefaultInputs[m['size']]
+        if 'outputs' not in m:
+            m['outputs'] = DefaultOutputs[m['size']]
+        NameToMachine[m['EN']] = i
+    PowerSize = _config['power']['size']
+    PowerRange = _config['power']['range']
+    Rewards = _config['rewards']
 
 
 class EndField:
-    def __init__(self, h: int, w: int, expect_graph: Graph):
+    def __init__(self, h: int, w: int, expect_graph: Graph, depot_edges: Sequence[int] = [0]):
         self.h = h
         self.w = w
+        self.depot_edges = depot_edges
+
         self.field = np.zeros((h, w, Channels.Num.value), dtype=np.int32) # Left-Up = 0, 0
-        self.nodes = np.zeros((len(expect_graph.Nodes), NodeAttrs.Num.value), dtype=np.int8)
+        self.field[..., Channels.ConnectedUp.value] = -1
+        self.field[..., Channels.ConnectedRight.value] = -1
+        
+        self.nodes = np.zeros((len(expect_graph.Nodes) + 2, NodeAttrs.Num.value), dtype=np.int32) # Add source and sink
+        self.nodes[..., NodeAttrs.Id.value] = np.arange(len(expect_graph.Nodes) + 2) + self.id_offset
+        
+        self.id_offset = random.randint(0, 32768)
+        
+        source_sink_edges = []
+        sourceid = len(expect_graph.Nodes)
+        sinkid = len(expect_graph.Nodes) + 1
         for i, t in enumerate(expect_graph.Nodes):
-            self.nodes[i, NodeAttrs.MachineType.value] = t
-        self.edges = np.array(expect_graph.Edges, dtype=np.int32)
+            self.nodes[i, NodeAttrs.MachineType.value] = t.MachineType
+            if t.MachineType in [NameToMachine['Depot-Unloader'], NameToMachine['Core']]:
+                source_sink_edges.append((sourceid, i))
+            elif t.MachineType in [NameToMachine['Depot-Loader'], NameToMachine['Core'], NameToMachine['Protocol-Stash']]:
+                source_sink_edges.append((i, sinkid))
+        self.nodes[sourceid:sinkid+1, NodeAttrs.MachineType.value] = NameToMachine['AbstractNode']
+        self.nodes[sourceid, NodeAttrs.Source.value] = 1
+        self.nodes[sinkid, NodeAttrs.Sink.value] = 1
+
+        edges = [(e.Source, e.Dest) for e in expect_graph.Edges]
+        self.src_to_dst = {e.Source: [] for e in expect_graph.Edges}
+        self.dst_to_src = {e.Dest: [] for e in expect_graph.Edges}
+        self.edges = np.array(edges + source_sink_edges, dtype=np.int32)
+        self.edge_attrs = np.zeros((len(edges) + len(source_sink_edges), EdgeAttrs.Num.value), dtype=np.int32)
+        self.edge_attrs[len(edges):, EdgeAttrs.Abstract.value] = 1
+        self.edge_attrs[len(edges):, EdgeAttrs.Connected.value] = 1
+        for i, e in enumerate(expect_graph.Edges):
+            self.src_to_dst[e.Source].append(e.Dest)
+            self.dst_to_src[e.Dest].append(e.Source)
+            if e.Optional:
+                self.edge_attrs[i, EdgeAttrs.Optional.value] = 1
+            self.edge_attrs[i, EdgeAttrs.Weight.value] = e.Weight
+        self.edge_to_idx = {tuple(e): i for i, e in enumerate(edges)}
+            
+
         self.global_mid = 1
+        self._finished = False
+
+    @property
+    def finished(self) -> bool:
+        return self._finished
 
     def get_action_mask(self) -> torch.Tensor:
         mask = torch.zeros(3, dtype=torch.bool)
@@ -83,7 +162,9 @@ class EndField:
     
     def get_spatial_machine_mask(self, machine_id) -> torch.Tensor:
         mtype = self.nodes[machine_id, NodeAttrs.MachineType.value]
-        r, c = Machines[mtype][1:3]
+        r, c = Machines[mtype]['size']
+        depot = Machines[mtype]['depot']
+
         mask = np.zeros((self.h, self.w, 2), dtype=np.bool)
         if r == 1:
             rowmask = self.field[..., Channels.Placed.value]
@@ -118,6 +199,26 @@ class EndField:
             mask[..., 1] = mask[..., 0]
         
         mask = np.concat([mask, mask], axis=-1)
+        
+        if depot:
+            depot_mask = np.zeros((self.h, self.w, 4), dtype=np.bool)
+            for depot_edge in self.depot_edges:
+                for d in range(4):
+                    r, c = Machines[mtype]['size']
+                    if d in [1, 3]:
+                        r, c = c, r
+                    if depot_edge == 0:
+                        depot_mask[0, :, d] = True
+                    elif depot_edge == 1:
+                        depot_mask[:, -c, d] = True
+                    elif depot_edge == 2:
+                        depot_mask[-r, :, d] = True
+                    elif depot_edge == 3:
+                        depot_mask[:, 0, d] = True
+        else:
+            depot_mask = np.ones((self.h, self.w, 4), dtype=np.bool)
+        
+        mask = np.logical_and(mask, depot_mask)
         return torch.from_numpy(mask).contiguous().to(dtype=torch.bool).reshape(-1, 4)
     
     def get_spatial_belt_mask(self) -> torch.Tensor:
@@ -130,7 +231,7 @@ class EndField:
         )
         io_mask = np.expand_dims(io_mask, axis=-1)
         directions = np.expand_dims(np.arange(4), axis=(0, 1))
-        io_dir_mask = self.field[..., Channels.MachineDirection.value, np.newaxis] == directions
+        io_dir_mask = self.field[..., Channels.PortDirection.value, np.newaxis] == directions
         io_mask = np.logical_and(io_mask, io_dir_mask)
         io_mask = torch.from_numpy(io_mask).to(dtype=torch.bool)
         
@@ -164,7 +265,7 @@ class EndField:
         return (io_mask | cross_mask | place_mask).reshape(-1, 4)
 
     def get_spatial_power_mask(self) -> torch.Tensor:
-        r, c = 2, 2
+        r, c = PowerSize
         mask = np.zeros((self.h, self.w), dtype=np.bool)
         if r == 1:
             rowmask = self.field[..., Channels.Placed.value]
@@ -182,22 +283,69 @@ class EndField:
         return torch.from_numpy(mask).contiguous().to(dtype=torch.bool).flatten()
 
     def get_states(self) -> Dict[str, Any]:
-        spatial_states = torch.from_numpy(self.field[..., Channels.Placed.value:]).contiguous().to(dtype=torch.int8)
-        spatial_types = torch.from_numpy(self.field[..., Channels.MachineType.value]).contiguous()
+        spatial_states = torch.tensor(self.field[..., Channels.Placed.value:]).to(dtype=torch.float32)
+        spatial_types = torch.tensor(self.field[..., Channels.MachineType.value])
+        spatial_ids = torch.tensor(self.field[..., Channels.MachineId.value]).to(dtype=torch.int32) + self.id_offset
+        graph_node_states = torch.tensor(self.nodes[..., NodeAttrs.Placed.value:]).to(dtype=torch.float32)
+        graph_node_types = torch.tensor(self.nodes[..., NodeAttrs.MachineType.value])
+        graph_node_ids = torch.tensor(self.nodes[..., NodeAttrs.Id.value]).to(dtype=torch.int32)
         return {
             'spatial_info': {
                 'states': spatial_states,
                 'types': spatial_types,
+                'ids': spatial_ids,
             },
             'spatial_hw': torch.tensor((self.h, self.w), dtype=torch.int32),
-            'graph_nodes': torch.from_numpy(self.nodes),
-            'edge_index': torch.from_numpy(self.edges),
+            'graph_nodes': {
+                'states': graph_node_states,
+                'types': graph_node_types,
+                'ids': graph_node_ids,
+            },
+            'edge_index': torch.tensor(self.edges),
+            'edge_attrs': torch.tensor(self.edge_attrs),
             'node_lengths': torch.tensor(self.nodes.shape[0]),
         }
+    
+    def check_finished(self) -> bool:
+        if not np.all(self.nodes[..., NodeAttrs.Placed.value] == 1):
+            return False
+        if not np.all(self.nodes[..., NodeAttrs.Powered.value] == 1):
+            return False
+        for dst, srcs in self.dst_to_src.items():
+            required = True
+            optional = False
+            for src in srcs:
+                idx = self.edge_to_idx[(src, dst)]
+                if self.edge_attrs[idx, EdgeAttrs.Optional.value] == 0:
+                    if self.edge_attrs[idx, EdgeAttrs.Connected.value] < self.edge_attrs[idx, EdgeAttrs.Weight.value]:
+                        required = False
+                else:
+                    if self.edge_attrs[idx, EdgeAttrs.Connected.value] >= self.edge_attrs[idx, EdgeAttrs.Weight.value]:
+                        optional = True
+            if not (required and optional):
+                return False
+        return True
+    
+    def check_dead(self) -> bool:
+        if not np.all(self.nodes[..., NodeAttrs.Placed.value] == 1):
+            for i in range(self.nodes.shape[0]):
+                if self.nodes[i, NodeAttrs.Placed.value] == 1:
+                    continue
+                if not self.get_spatial_machine_mask(i).any():
+                    return True
+        if not np.all(self.nodes[..., NodeAttrs.Powered.value] == 1):
+            if not self.get_spatial_power_mask().any():
+                return True
+        if not self.get_spatial_belt_mask().any():
+            return True
+        return False
 
     def put_machine(self, machine_id, position, direction):
         machine_type = self.nodes[machine_id, NodeAttrs.MachineType.value]
-        name, r, c, inputs, outputs = Machines[machine_type]
+        r, c = Machines[machine_type]['size']
+        inputs = Machines[machine_type]['inputs']
+        outputs = Machines[machine_type]['outputs']
+        reward = 0
         if direction in [Directions.Right.value, Directions.Left.value]:
             r, c = c, r
         x, y = position
@@ -212,8 +360,7 @@ class EndField:
                 self.field[i, j, Channels.Placed.value] = 1
                 self.field[i, j, Channels.IsMachine.value] = 1
                 self.field[i, j, Channels.MachineType.value] = machine_type
-                self.field[i, j, Channels.MachineDirection.value] = direction
-                self.field[i, j, Channels.MachineId.value] = self.global_mid
+                self.field[i, j, Channels.MachineId.value] = machine_id
 
         # rotate clockwise 90 first
         if direction in [Directions.Right.value, Directions.Left.value]:
@@ -223,16 +370,99 @@ class EndField:
         if direction in [Directions.Down.value, Directions.Left.value]:
             inputs = ((r - xx, c - yy) for xx, yy in inputs)
             outputs = ((r - xx, c - yy) for xx, yy  in inputs)
-        for xx, yy in inputs:
+        for xx, yy, *port_direction in inputs:
             self.field[x + xx, y + yy, Channels.InputPort.value] = 1
-        for xx, yy in outputs:
+            if len(port_direction) > 0:
+                pd = port_direction[0]
+            else:
+                pd = Directions.Up.value
+            pd = (pd + direction) % len(Directions)
+            self.field[x + xx, y + yy, Channels.PortDirection.value] = pd
+            if pd in [Directions.Up.value, Directions.Down.value]:
+                self.field[x + xx, y + yy, Channels.PortUp.value] = 1 if pd == Directions.Up.value else -1
+            else:
+                self.field[x + xx, y + yy, Channels.PortRight.value] = 1 if pd == Directions.Right.value else -1
+        for xx, yy, *port_direction in outputs:
             self.field[x + xx, y + yy, Channels.OutputPort.value] = 1
+            if len(port_direction) > 0:
+                pd = port_direction[0]
+            else:
+                pd = Directions.Up.value
+            pd = (pd + direction) % len(Directions)
+            self.field[x + xx, y + yy, Channels.PortDirection.value] = pd
+            if pd in [Directions.Up.value, Directions.Down.value]:
+                self.field[x + xx, y + yy, Channels.PortUp.value] = 1 if pd == Directions.Up.value else -1
+            else:
+                self.field[x + xx, y + yy, Channels.PortRight.value] = 1 if pd == Directions.Right.value else -1
 
         self.nodes[machine_id, NodeAttrs.Placed.value] = 1
-        self.global_mid += 1
+        all_placed = self.nodes[:-2, NodeAttrs.Placed.value].all()
+        if all_placed:
+            reward += Rewards['all_machine_placed']
+        if self.check_finished():
+            reward += Rewards['finished']
+            self._finished = True
+        elif self.check_dead():
+            reward += Rewards['dead_end']
+            self._finished = True
+        return reward
+    
+    def _broadcast_connection(self, *position, direction=None):
+        x, y = position
+        assert self.field[x, y, Channels.IsBelt.value] == 1
+        if direction is None:
+            assert self.field[x, y, Channels.BeltCross.value] == 0
+            if self.field[x, y, Channels.BeltUp.value] != 0:
+                direction = Directions.Up.value if self.field[x, y, Channels.BeltUp.value] == 1 else Directions.Down.value
+            elif self.field[x, y, Channels.BeltRight.value] != 0:
+                direction = Directions.Right.value if self.field[x, y, Channels.BeltRight.value] == 1 else Directions.Left.value
+        
+        while True:
+            if direction in [Directions.Up.value, Directions.Down.value]:
+                if self.field[x, y, Channels.BeltUp.value] == 0:
+                    return 0
+                conn = self.field[x, y, Channels.ConnectedUp.value]
+            else:
+                if self.field[x, y, Channels.BeltRight.value] == 0:
+                    return 0
+                conn = self.field[x, y, Channels.ConnectedRight.value]
+            if conn == -1:
+                return 0
+            xx = x + DirectionDxDy[direction][0]
+            yy = y + DirectionDxDy[direction][1]
+            
+            if self.field[xx, yy, Channels.IsBelt.value] == 0:
+                return 0
+            if self.field[xx, yy, Channels.BeltCross.value] != 0:
+                chann = Channels.ConnectedUp.value if direction in [Directions.Up.value, Directions.Down.value] else Channels.ConnectedRight.value
+                self.field[xx, yy, chann] =  conn
+                dd = direction
+            else:
+                chann = Channels.ConnectedRight.value if self.field[xx, yy, Channels.BeltUp.value] != 0 else Channels.ConnectedUp.value
+                self.field[xx, yy, chann] = conn
+                if self.field[xx, yy, Channels.BeltUp.value] != 0:
+                    dd = Directions.Up.value if self.field[xx, yy, Channels.BeltUp.value] == 1 else Directions.Down.value
+                else:
+                    dd = Directions.Right.value if self.field[xx, yy, Channels.BeltRight.value] == 1 else Directions.Left.value
+            
+            if self.field[xx, yy, Channels.IsMachine.value] == 1:
+                dst = self.field[xx, yy, Channels.MachineId.value]
+                if (conn, dst) in self.edge_to_idx:
+                    idx = self.edge_to_idx[(conn, dst)]
+                    self.edge_attrs[idx, EdgeAttrs.Connected.value] += 1
+                    if len(self.edge_matches) == 0:
+                        self._finished = True
+                        return Rewards['all_matched']
+                    return Rewards['connected']
+                else:
+                    return Rewards['unmatched']
+            
+            x, y, direction = xx, yy, dd
     
     def put_belt(self, position, direction):
+        updown = direction in [Directions.Up.value, Directions.Down.value]
         x, y = position
+        reward = 0
         if self.field[x, y, Channels.Placed.value] == 0:
             self.field[x, y, Channels.Placed.value] = 1
             self.field[x, y, Channels.IsBelt.value] = 1
@@ -243,6 +473,8 @@ class EndField:
 
             hasStraight = False
             hasTurn = False
+            straightFrom = -1
+            turnFrom = -1
             for d in range(4):
                 if d == direction:
                     continue
@@ -260,24 +492,54 @@ class EndField:
                 elif dd in [Directions.Up, Directions.Down]:
                     if self.field[xx, yy, Channels.BeltUp.value] == (1 if dd == Directions.Up else -1):
                         pointsTo = True
+                ddupdown = dd in [Directions.Up, Directions.Down]
                 if pointsTo:
                     if dd == direction:
                         hasStraight = True
+                        straightFrom = self.field[
+                            xx, yy,
+                            Channels.ConnectedUp.value if ddupdown else Channels.ConnectedRight.value
+                        ]
                     else:
                         hasTurn = True
+                        turnFrom = self.field[
+                            xx, yy,
+                            Channels.ConnectedUp.value if ddupdown else Channels.ConnectedRight.value
+                        ]
             if not hasStraight and hasTurn:
                 self.field[x, y, Channels.BeltTurn.value] = 1
+                self.field[x, y, Channels.ConnectedUp.value if updown else Channels.ConnectedRight.value] = turnFrom
+                reward += Rewards['belt_extend']
+                reward += self._broadcast_connection(x, y)
+            elif hasStraight:
+                self.field[x, y, Channels.ConnectedUp.value if updown else Channels.ConnectedRight.value] = straightFrom
+                reward += Rewards['belt_extend']
+                reward += self._broadcast_connection(x, y)
+            else:
+                reward += Rewards['alone_belt']
 
         elif self.field[x, y, Channels.InputPort.value] == 1 or self.field[x, y, Channels.OutputPort.value] == 1:
             if self.field[x, y, Channels.IsBelt.value]:
                 raise RuntimeError()
             self.field[x, y, Channels.IsBelt.value] = 1
-            if direction !=  self.field[x, y, Channels.MachineDirection.value]:
+            if direction !=  self.field[x, y, Channels.PortDirection.value]:
                 raise RuntimeError()
-            if direction in [Directions.Right.value, Directions.Left.value]:
+            if not updown:
                 self.field[x, y, Channels.BeltRight.value] = 1 if direction == Directions.Right.value else -1
-            elif direction in [Directions.Up.value, Directions.Down.value]:
+            else:
                 self.field[x, y, Channels.BeltUp.value] = 1 if direction == Directions.Up.value else -1
+            
+            if self.field[x, y, Channels.InputPort.value] == 1:
+                self.field[x, y, Channels.ConnectedUp.value if updown else Channels.ConnectedRight.value] = self.field[x, y, Channels.MachineId.value]
+                reward += Rewards['belt_extend']
+                reward += self._broadcast_connection(x, y)
+            else:
+                xx = x + DirectionDxDy[RevDirections[direction].value][0]
+                yy = y + DirectionDxDy[RevDirections[direction].value][1]
+                if self.field[xx, yy, Channels.IsBelt.value] == 1:
+                    reward += self._broadcast_connection(xx, yy, direction=direction)
+                else:
+                    reward += Rewards['alone_belt']
         
         elif self.field[x, y, Channels.IsBelt.value] == 1:
             if direction in [Directions.Right.value, Directions.Left.value]:
@@ -286,35 +548,66 @@ class EndField:
                 self.field[x, y, Channels.BeltUp.value] = 1 if direction == Directions.Right.value else -1
                 self.field[x, y, Channels.BeltCross.value] = 1
             elif direction in [Directions.Up.value, Directions.Down.value]:
+                if self.field[x, y, Channels.BeltUp.value] != 0:
+                    raise RuntimeError()
                 self.field[x, y, Channels.BeltUp.value] = 1 if direction == Directions.Up.value else -1
                 self.field[x, y, Channels.BeltCross.value] = 1
+            
+            xx = x + DirectionDxDy[RevDirections[direction].value][0]
+            yy = y + DirectionDxDy[RevDirections[direction].value][1]
+            if self.field[xx, yy, Channels.IsBelt.value] == 1:
+                reward += self._broadcast_connection(xx, yy, direction=direction)
+            else:
+                reward += Rewards['alone_belt']
         
         else:
             raise RuntimeError()
+        
+        if self.check_finished():
+            reward += Rewards['finished']
+            self._finished = True
+        elif self.check_dead():
+            reward += Rewards['dead_end']
+            self._finished = True
+        return reward
 
     def put_power(self, position):
         x, y = position
-        for i in (x, x+1):
+        reward = 0
+        for i in range(x, x+PowerSize[0]):
             if i >= self.h:
                 raise RuntimeError()
-            for j in (y, y+1):
+            for j in range(y, y+PowerSize[1]):
                 if j >= self.w:
                     raise RuntimeError()
                 if self.field[i, j, Channels.Placed.value]:
                     raise RuntimeError()
         
-        for i in (x, x+1):
-            for j in (y, y+1):
+        for i in range(x, x+PowerSize[0]):
+            for j in range(y, y+PowerSize[1]):
                 self.field[i, j, Channels.Placed.value] = 1
                 self.field[i, j, Channels.IsPower.value] = 1
 
-        for i in range(x-5, x+7):
+        for i in range(x-PowerRange[0], x+PowerRange[1]):
             if i < 0 or i >= self.h:
                 continue
-            for j in range(y-5, y+7):
+            for j in range(y-PowerRange[0], y+PowerRange[1]):
                 if j < 0 or j >= self.w:
                     continue
                 self.field[i, j, Channels.Powered.value] = 1
                 if self.field[i, j, Channels.IsMachine.value] == 1:
                     machine_id = self.field[i, j, Channels.MachineId.value]
+                    if not self.nodes[machine_id, NodeAttrs.Powered.value]:
+                        reward += Rewards['machine_powered']
                     self.nodes[machine_id, NodeAttrs.Powered.value] = 1
+        if self.check_finished():
+            reward += Rewards['finished']
+            self._finished = True
+        elif self.check_dead():
+            reward += Rewards['dead_end']
+            self._finished = True
+        return reward
+        
+
+def generate_new_game(level: int) -> EndField:
+    return

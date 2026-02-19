@@ -61,7 +61,7 @@ class EFLayoutSpatialAttention(nn.Module):
             key_states,
             value_states,
             attn_mask=attn_mask,
-            dropout_p=self.attention_dropout,
+            dropout_p=self.attention_dropout if self.training else 0.0,
             scale=self.scaling,
             is_causal=self.is_causal,
         )
@@ -126,10 +126,11 @@ class EFLayoutRotaryEmbedding(nn.Module):
 
 
 class EFLayoutSpatialModel(nn.Module):
-    def __init__(self, config: EFLayoutSpatialConfig):
+    def __init__(self, config: EFLayoutSpatialConfig, id_emb: nn.Embedding):
         super().__init__()
+        self.id_emb = id_emb
         self.type_emb = nn.Embedding(config.type_num, config.type_dim)
-        self.state_emb = nn.Linear(config.state_dim, config.hidden_size - config.type_dim)
+        self.state_emb = nn.Linear(config.state_dim, config.hidden_size - config.type_dim - config.id_size)
         dim = config.hidden_size // config.num_heads
         self.rot_pos_emb = EFLayoutRotaryEmbedding(dim, config.theta)
 
@@ -177,12 +178,14 @@ class EFLayoutSpatialModel(nn.Module):
         return torch.block_diag(blocks)
     
     def forward(self, spatial_info: Dict[str, torch.Tensor], spatial_hw: torch.Tensor) -> torch.Tensor:
+        id_emb = self.id_emb(spatial_info['ids'])
+        
         type_emb = self.type_emb(spatial_info['types'])
 
         rotary_pos_emb = self.get_position_embeddings(spatial_hw)
         hidden_states = self.state_emb(spatial_info['states'])
 
-        hidden_states = torch.cat([hidden_states, type_emb], dim=-1)
+        hidden_states = torch.cat([id_emb, type_emb, hidden_states], dim=-1)
         
         seq_len, _ = hidden_states.size()
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
@@ -239,8 +242,9 @@ class EFLayoutGraphBlock(nn.Module):
 
 
 class EFLayoutGraphModel(nn.Module):
-    def __init__(self, config: EFLayoutGraphConfig):
+    def __init__(self, config: EFLayoutGraphConfig, id_emb: nn.Embedding):
         super().__init__()
+        self.id_emb = id_emb
         self.type_emb = nn.Embedding(config.type_num, config.type_dim)
         self.blocks = nn.ModuleList([
             EFLayoutGraphBlock(config, layer_idx)
@@ -250,12 +254,13 @@ class EFLayoutGraphModel(nn.Module):
 
     def forward(
         self,
-        graph_nodes: torch.Tensor,
+        graph_nodes: Dict[str, torch.Tensor],
         edge_index: torch.Tensor,
         edge_attrs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        type_emb = self.type_emb(graph_nodes[:, 0])
-        hidden_states = torch.cat([type_emb, graph_nodes[:, 1:]], dim=1)
+        id_emb = self.id_emb(graph_nodes['ids'])
+        type_emb = self.type_emb(graph_nodes['types'])
+        hidden_states = torch.cat([id_emb, type_emb, graph_nodes['states']], dim=1)
 
         for block in self.blocks:
             hidden_states = block(hidden_states, edge_index, edge_attrs)
@@ -280,8 +285,9 @@ class EFLayoutModelBackbone(nn.Module):
         super().__init__()
         self.config = config
 
-        self.spatial = EFLayoutSpatialModel(config.spatial_config)
-        self.graph = EFLayoutGraphModel(config.graph_config)
+        self.id_emb = nn.Embedding(config.id_buckets, config.id_size)
+        self.spatial = EFLayoutSpatialModel(config.spatial_config, self.id_emb)
+        self.graph = EFLayoutGraphModel(config.graph_config, self.id_emb)
         self.spatial_proj = nn.Linear(config.spatial_config.output_dim, config.hidden_size)
         self.graph_proj = nn.Linear(config.graph_config.output_dim, config.hidden_size)
         self.context_proj = nn.Linear(config.hidden_size * 2, config.hidden_size)
@@ -290,7 +296,7 @@ class EFLayoutModelBackbone(nn.Module):
         self,
         spatial_info: Dict[str, torch.Tensor],
         spatial_hw: torch.Tensor, # (B, 2)
-        graph_nodes: torch.Tensor, # (sum N_n, D_g)
+        graph_nodes: Dict[str, torch.Tensor], # (sum N_n, D_g)
         edge_index: torch.Tensor, # (2, sum N_e)
         node_lengths: torch.Tensor, # (B)
         edge_attrs: Optional[torch.Tensor] = None, # (sum N_e, D_e)

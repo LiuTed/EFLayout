@@ -1,0 +1,93 @@
+machines:
+  - EN: Refining
+    CN: 精炼机
+    size: [3, 3]
+  - EN: Shredding
+    CN: 粉碎机
+    size: [3, 3]
+  - EN: Fitting
+    CN: 配件机
+    size: [3, 3]
+  - EN: Moulding
+    CN: 塑形机
+    size: [3, 3]
+  - EN: Seed-Picking
+    CN: 采种机
+    size: [5, 5]
+  - EN: Planting
+    CN: 种植机
+    size: [5, 5]
+  - EN: Gearing
+    CN: 装备原件机
+    size: [3, 6]
+  - EN: Filling
+    CN: 灌装机
+    size: [3, 6]
+  - EN: Packing
+    CN: 封装机
+    size: [3, 6]
+  - EN: Grinding
+    CN: 研磨机
+    size: [3, 6]
+  - EN: Core
+    CN: 协议核心
+    size: [9, 9]
+    inputs:
+      - [0, 1, 2]
+      - [0, 2, 2]
+      - [0, 3, 2]
+      - [0, 4, 2]
+      - [0, 5, 2]
+      - [0, 6, 2]
+      - [0, 7, 2]
+      - [0, 8, 2]
+      - [8, 1]
+      - [8, 2]
+      - [8, 3]
+      - [8, 4]
+      - [8, 5]
+      - [8, 6]
+      - [8, 7]
+      - [8, 8]
+    outputs:
+      - [1, 0, 3]
+      - [4, 0, 3]
+      - [7, 0, 3]
+      - [1, 8, 1]
+      - [4, 8, 1]
+      - [7, 8, 1]
+  - EN: Depot-Loader
+    CN: 仓库存货口
+    size: [1, 3]
+    inputs: [0, 1]
+    outputs: []
+    depot: true
+  - EN: Depot-Unloader
+    CN: 仓库取货口
+    size: [1, 3]
+    inputs: []
+    outputs: [8, 1]
+    depot: true
+  - EN: Protocol-Stash
+    CN: 协议储存箱
+    size: [3, 3]
+  - EN: AbstractNode
+    CN: 抽象点
+    size: [0, 0]
+    inputs: []
+    outputs: []
+    public: false
+  
+power:
+  size: [2, 2]
+  range: [5, 6]
+
+rewards:
+  belt_extend: 1.0
+  alone_belt: -0.5
+  connected: 3.0
+  unmatched: -5.0
+  finished: 100.0
+  all_machine_placed: 20.0
+  machine_powered: 1.0
+  dead_end: -100.0
