@@ -59,14 +59,16 @@ machines:
   - EN: Depot-Loader
     CN: 仓库存货口
     size: [1, 3]
-    inputs: [0, 1]
+    inputs:
+      - [0, 1]
     outputs: []
     depot: true
   - EN: Depot-Unloader
     CN: 仓库取货口
     size: [1, 3]
     inputs: []
-    outputs: [8, 1]
+    outputs:
+      - [0, 1]
     depot: true
   - EN: Protocol-Stash
     CN: 协议储存箱

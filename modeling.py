@@ -1,4 +1,4 @@
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
 from torch.distributions import Categorical
 
-from .configuration import EFLayoutConfig, EFLayoutGraphConfig, EFLayoutSpatialConfig, EFLayoutActorConfig
+from configuration import EFLayoutConfig, EFLayoutGraphConfig, EFLayoutSpatialConfig
 
 
 
@@ -20,6 +20,8 @@ def rotate_half(x):
 def apply_rotary_pos_emb(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.unsqueeze(-2).float()
+    sin = sin.unsqueeze(-2).float()
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -66,7 +68,7 @@ class EFLayoutSpatialAttention(nn.Module):
             is_causal=self.is_causal,
         )
 
-        attn_output = attn_output.reshape(bs, seq_length, -1).contiguous()
+        attn_output = attn_output.reshape(seqlen, -1).contiguous()
         attn_output = self.proj(attn_output)
         return attn_output
            
@@ -132,7 +134,7 @@ class EFLayoutSpatialModel(nn.Module):
         self.type_emb = nn.Embedding(config.type_num, config.type_dim)
         self.state_emb = nn.Linear(config.state_dim, config.hidden_size - config.type_dim - config.id_size)
         dim = config.hidden_size // config.num_heads
-        self.rot_pos_emb = EFLayoutRotaryEmbedding(dim, config.theta)
+        self.rot_pos_emb = EFLayoutRotaryEmbedding(dim // 2, config.theta)
 
         self.blocks = nn.ModuleList([
             EFLayoutSpatialBlock(config)
@@ -174,11 +176,11 @@ class EFLayoutSpatialModel(nn.Module):
     
     def get_attn_mask(self, spatial_hw: torch.Tensor) -> torch.Tensor:
         cu_seqlens = spatial_hw.prod(-1)
-        blocks = [torch.ones(n, n, dtype=torch.bool, device=spatial_hw.device) for n in cu_seqlens]
-        return torch.block_diag(blocks)
+        blocks = [torch.ones((n, n), dtype=torch.bool, device=spatial_hw.device) for n in cu_seqlens]
+        return torch.block_diag(*blocks)
     
     def forward(self, spatial_info: Dict[str, torch.Tensor], spatial_hw: torch.Tensor) -> torch.Tensor:
-        id_emb = self.id_emb(spatial_info['ids'])
+        id_emb = self.id_emb(spatial_info['ids'] % self.id_emb.num_embeddings)
         
         type_emb = self.type_emb(spatial_info['types'])
 
@@ -209,7 +211,7 @@ class EFLayoutGraphBlock(nn.Module):
             self.edge_dim = config.edge_dim
         if layer_idx == 0:
             self.attn = GATv2Conv(
-                config.state_dim + config.type_dim,
+                config.state_dim + config.type_dim + config.id_size,
                 config.hidden_size,
                 heads=config.num_heads,
                 edge_dim=self.edge_dim,
@@ -258,7 +260,7 @@ class EFLayoutGraphModel(nn.Module):
         edge_index: torch.Tensor,
         edge_attrs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        id_emb = self.id_emb(graph_nodes['ids'])
+        id_emb = self.id_emb(graph_nodes['ids'] % self.id_emb.num_embeddings)
         type_emb = self.type_emb(graph_nodes['types'])
         hidden_states = torch.cat([id_emb, type_emb, graph_nodes['states']], dim=1)
 
@@ -319,7 +321,7 @@ class EFLayoutModelBackbone(nn.Module):
             graph_avg.append(part.mean(dim=0))
         graph_avg = torch.stack(graph_avg, dim=0)
 
-        context = torch.cat([spatial, graph], dim=-1)
+        context = torch.cat([spatial_avg, graph_avg], dim=-1)
         context = self.context_proj(context)
 
         return {
@@ -328,11 +330,14 @@ class EFLayoutModelBackbone(nn.Module):
             'graph_embeds': graph, # (sum N_n, D)
             'spatial_embeds_avg': spatial_avg, # (B, D)
             'graph_embeds_avg': graph_avg, # (B, D)
+            'spatial_hw': spatial_hw,
+            'node_lengths': node_lengths,
         }
         
 
-class EFLayoutActorCritic:
+class EFLayoutActorCritic(nn.Module):
     def __init__(self, config: EFLayoutConfig):
+        super().__init__()
         self.critic = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.ReLU(),
@@ -353,12 +358,16 @@ class EFLayoutActorCritic:
         # power supply
         self.p_q_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.p_k_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        
+        self.config = config
 
     def get_critic(self, context: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.critic(context)
     
-    def get_action(self, context: torch.Tensor, **kwargs) -> torch.Tensor:
-        return self.action_selector(context)
+    def get_action(self, context: torch.Tensor, action_mask: torch.Tensor, **kwargs) -> torch.Tensor:
+        logits = self.action_selector(context)
+        logits[action_mask.reshape(-1, 3).logical_not()] = -float('inf')
+        return logits.flatten(), logits.unbind(0)
     
     def get_machine(
         self,
@@ -373,16 +382,16 @@ class EFLayoutActorCritic:
 
         all_logits = []
         for q, k, mask in zip(
-            msq.unsqueeze(-2),
+            msq,
             msk.split(node_lengths.tolist()),
             machine_mask.split(node_lengths.tolist())
         ):
-            logits = F.linear(q, k)
+            logits = torch.inner(q, k) # (D) . (N_n, D) -> (N_n)
             logits[mask.logical_not()] = -float('inf')
 
             all_logits.append(logits)
 
-        return torch.cat(all_logits, dim=0)
+        return torch.cat(all_logits, dim=0), all_logits
     def get_location_orientation(
         self,
         spatial_embeds: torch.Tensor, # (sum M*N, D)
@@ -393,7 +402,7 @@ class EFLayoutActorCritic:
         selected: torch.Tensor, # (B)
         **kwargs
     ):
-        start_idx = node_lengths.cumsum(dim=0)
+        start_idx = F.pad(node_lengths, (1, 0), value=0).cumsum(dim=0)[:-1]
         memb = graph_embeds[start_idx + selected]
         mloq = self.mlo_q_proj(memb) # (B, D)
         mlok = self.mlo_k_proj(spatial_embeds).reshape(-1, 4, self.config.intermediate_size) # (sum M*N, 4, D)
@@ -401,16 +410,17 @@ class EFLayoutActorCritic:
         slen = spatial_hw.prod(-1).tolist()
         all_logits = []
         for q, k, mask in zip(
-            mloq.unsqueeze(-2),
+            mloq,
             mlok.split(slen),
             spatial_machine_mask.split(slen)
         ):
-            logits = F.linear(q, k).squeeze(0)
+            logits = torch.inner(q, k)
             logits[mask.logical_not()] = -float('inf')
+            logits = logits.flatten()
             
             all_logits.append(logits)
         
-        return torch.cat(all_logits, dim=0)
+        return torch.cat(all_logits, dim=0), all_logits
     
     def get_belt_location_orientation(
         self,
@@ -420,22 +430,23 @@ class EFLayoutActorCritic:
         spatial_hw: torch.Tensor, # (B, 2)
         **kwargs
     ) -> torch.Tensor:
-        msq = self.ms_q_proj(context)
-        msk = self.ms_k_proj(spatial_embeds).reshape(-1, 4, self.config.intermediate_size)
+        bq = self.b_q_proj(context)
+        bk = self.b_k_proj(spatial_embeds).reshape(-1, 4, self.config.intermediate_size)
 
         all_logits = []
         slen = spatial_hw.prod(-1).tolist()
         for q, k, mask in zip(
-            msq.unsqueeze(-2),
-            msk.split(slen),
+            bq,
+            bk.split(slen),
             spatial_belt_mask.split(slen)
         ):
-            logits = F.linear(q, k)
+            logits = torch.inner(q, k)
             logits[mask.logical_not()] = -float('inf')
+            logits = logits.flatten()
 
             all_logits.append(logits)
 
-        return torch.cat(all_logits, dim=0)
+        return torch.cat(all_logits, dim=0), all_logits
     
     def get_power_location(
         self,
@@ -445,19 +456,19 @@ class EFLayoutActorCritic:
         spatial_power_mask: torch.Tensor, # (sum M*N)
         **kwargs
     ) -> torch.Tensor:
-        msq = self.ms_q_proj(context)
-        msk = self.ms_k_proj(spatial_embeds)
+        pq = self.p_q_proj(context)
+        pk = self.p_k_proj(spatial_embeds)
 
         all_logits = []
         slen = spatial_hw.prod(-1).tolist()
         for q, k, mask in zip(
-            msq.unsqueeze(-2),
-            msk.split(slen),
+            pq.unsqueeze(-2),
+            pk.split(slen),
             spatial_power_mask.split(slen)
         ):
-            logits = F.linear(q, k)
+            logits = torch.inner(q, k)
             logits[mask.logical_not()] = -float('inf')
 
             all_logits.append(logits)
 
-        return torch.cat(all_logits, dim=0)
+        return torch.cat(all_logits, dim=0), all_logits

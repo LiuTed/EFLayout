@@ -1,0 +1,29 @@
+{
+    "spatial_config": {
+        "type_num": 14,
+        "type_dim": 32,
+        "state_dim": 13,
+        "output_dim": 256,
+        "hidden_size": 256,
+        "num_heads": 8,
+        "intermediate_size": 512,
+        "dropout": 0.1,
+        "num_layers": 8,
+        "theta": 10000.0
+    },
+    "graph_config": {
+        "type_num": 15,
+        "type_dim": 32,
+        "state_dim": 4,
+        "output_dim": 128,
+        "edge_dim": 4,
+        "hidden_size": 256,
+        "num_heads": 4,
+        "dropout": 0.1,
+        "num_layers": 4
+    },
+    "id_buckets": 128,
+    "id_size": 16,
+    "hidden_size": 256,
+    "intermediate_size": 512
+}

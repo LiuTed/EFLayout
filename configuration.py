@@ -38,5 +38,7 @@ class EFLayoutConfig:
     intermediate_size: int
     
     def __post_init__(self):
+        self.spatial_config = EFLayoutSpatialConfig(**self.spatial_config)
+        self.graph_config = EFLayoutGraphConfig(**self.graph_config)
         self.spatial_config.id_size = self.id_size
         self.graph_config.id_size = self.id_size

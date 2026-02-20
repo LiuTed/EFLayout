@@ -4,13 +4,14 @@ import yaml
 from enum import Enum, auto
 from dataclasses import dataclass
 from typing import Sequence, Union, Optional, Any, Dict
+from functools import lru_cache
 
 import numpy as np
 import torch
 
 
 class Channels(Enum):
-    MachineType = auto()
+    MachineType = 0
     MachineId = auto()
     PortDirection = auto()
     ConnectedUp = auto()
@@ -32,7 +33,7 @@ class Channels(Enum):
     Num = auto()
 
 class Directions(Enum):
-    Up = auto()
+    Up = 0
     Right = auto()
     Down = auto()
     Left = auto()
@@ -54,7 +55,7 @@ class Graph:
     Edges: Sequence[GraphEdge]
 
 class NodeAttrs(Enum):
-    Id = auto()
+    Id = 0
     MachineType = auto()
     # model features starts here
     Placed = auto()
@@ -64,7 +65,7 @@ class NodeAttrs(Enum):
     Num = auto()
 
 class EdgeAttrs(Enum):
-    Abstract = auto()
+    Abstract = 0
     Weight = auto()
     Connected = auto()
     Optional = auto()
@@ -90,9 +91,17 @@ with open(os.path.join(os.path.dirname(__file__), 'game_config.yaml'), 'r') as f
     NameToMachine = {}
     for i, m in enumerate(Machines):
         if 'inputs' not in m:
-            m['inputs'] = DefaultInputs[m['size']]
+            inputs = DefaultInputs[tuple(m['size'])]
+        else:
+            inputs = m['inputs']
+        inputs = ((*inp, 0) if len(inp) == 2 else inp for inp in inputs)
+        m['inputs'] = tuple(inputs)
         if 'outputs' not in m:
-            m['outputs'] = DefaultOutputs[m['size']]
+            outputs = DefaultOutputs[tuple(m['size'])]
+        else:
+            outputs = m['outputs']
+        outputs = ((*out, 0) if len(out) == 2 else out for out in outputs)
+        m['outputs'] = tuple(outputs)
         NameToMachine[m['EN']] = i
     PowerSize = _config['power']['size']
     PowerRange = _config['power']['range']
@@ -103,6 +112,11 @@ class EndField:
     def __init__(self, h: int, w: int, expect_graph: Graph, depot_edges: Sequence[int] = [0]):
         self.h = h
         self.w = w
+        self.minx = h
+        self.miny = w
+        self.maxx = -1
+        self.maxy = -1
+        self.id_offset = random.randint(0, 32768)
         self.depot_edges = depot_edges
 
         self.field = np.zeros((h, w, Channels.Num.value), dtype=np.int32) # Left-Up = 0, 0
@@ -111,9 +125,7 @@ class EndField:
         
         self.nodes = np.zeros((len(expect_graph.Nodes) + 2, NodeAttrs.Num.value), dtype=np.int32) # Add source and sink
         self.nodes[..., NodeAttrs.Id.value] = np.arange(len(expect_graph.Nodes) + 2) + self.id_offset
-        
-        self.id_offset = random.randint(0, 32768)
-        
+
         source_sink_edges = []
         sourceid = len(expect_graph.Nodes)
         sinkid = len(expect_graph.Nodes) + 1
@@ -158,42 +170,43 @@ class EndField:
         return mask
 
     def get_machine_mask(self) -> torch.Tensor:
-        return torch.tensor(self.nodes[..., NodeAttrs.Placed.value] == 0, dtype=torch.bool)
+        return torch.tensor(self.nodes[..., NodeAttrs.Placed.value] == 0, dtype=torch.bool).flatten()
     
+    @lru_cache()
     def get_spatial_machine_mask(self, machine_id) -> torch.Tensor:
         mtype = self.nodes[machine_id, NodeAttrs.MachineType.value]
         r, c = Machines[mtype]['size']
-        depot = Machines[mtype]['depot']
+        depot = Machines[mtype].get('depot', False)
 
         mask = np.zeros((self.h, self.w, 2), dtype=np.bool)
         if r == 1:
-            rowmask = self.field[..., Channels.Placed.value]
+            rowmask = self.field[..., Channels.Placed.value] == 0
         else:
             rowcum = self.field[..., Channels.Placed.value].cumsum(axis=0)
             rowmask = rowcum[:-r+1] == rowcum[r-1:]
-            rowmask = np.logical_and(rowmask, self.field[:-r+1, :, Channels.Placed.value])
+            rowmask = np.logical_and(rowmask, self.field[:-r+1, :, Channels.Placed.value] == 0)
         if c == 1:
-            colmask = self.field[..., Channels.Placed.value]
+            colmask = self.field[..., Channels.Placed.value] == 0
         else:
             colcum = self.field[..., Channels.Placed.value].cumsum(axis=1)
-            colmask = colcum[:, :-c+1] == colcum[c-1:]
-            colmask = np.logical_and(colmask, self.field[:, :-c+1: Channels.Placed.value])
+            colmask = colcum[:, :-c+1] == colcum[:, c-1:]
+            colmask = np.logical_and(colmask, self.field[:, :-c+1, Channels.Placed.value] == 0)
         mask[:self.h-r+1, :self.w-c+1, 0] = np.logical_and(rowmask[:, :self.w-c+1], colmask[:self.h-r+1, :])
 
         if r != c:
             r, c = c, r
             if r == 1:
-                rowmask = self.field[..., Channels.Placed.value]
+                rowmask = self.field[..., Channels.Placed.value] == 0
             else:
                 rowcum = self.field[..., Channels.Placed.value].cumsum(axis=0)
                 rowmask = rowcum[:-r+1] == rowcum[r-1:]
-                rowmask = np.logical_and(rowmask, self.field[:-r+1, :, Channels.Placed.value])
+                rowmask = np.logical_and(rowmask, self.field[:-r+1, :, Channels.Placed.value] == 0)
             if c == 1:
-                colmask = self.field[..., Channels.Placed.value]
+                colmask = self.field[..., Channels.Placed.value] == 0
             else:
                 colcum = self.field[..., Channels.Placed.value].cumsum(axis=1)
-                colmask = colcum[:, :-c+1] == colcum[c-1:]
-                colmask = np.logical_and(colmask, self.field[:, :-c+1: Channels.Placed.value])
+                colmask = colcum[:, :-c+1] == colcum[:, c-1:]
+                colmask = np.logical_and(colmask, self.field[:, :-c+1, Channels.Placed.value] == 0)
             mask[:self.h-r+1, :self.w-c+1, 1] = np.logical_and(rowmask[:, :self.w-c+1], colmask[:self.h-r+1, :])
         else:
             mask[..., 1] = mask[..., 0]
@@ -221,6 +234,7 @@ class EndField:
         mask = np.logical_and(mask, depot_mask)
         return torch.from_numpy(mask).contiguous().to(dtype=torch.bool).reshape(-1, 4)
     
+    @lru_cache()
     def get_spatial_belt_mask(self) -> torch.Tensor:
         io_mask = np.logical_and(
             np.logical_or(
@@ -247,7 +261,6 @@ class EndField:
             cross_mask,
             self.field[..., Channels.BeltTurn.value] == 0
         )
-        cross_mask = np.expand_dims(cross_mask, axis=-1)
         cross_right_mask = np.logical_and(
             cross_mask,
             self.field[..., Channels.BeltRight.value] == 0
@@ -256,7 +269,7 @@ class EndField:
             cross_mask,
             self.field[..., Channels.BeltUp.value] == 0
         )
-        cross_mask = np.concat([cross_up_mask, cross_right_mask, cross_up_mask, cross_right_mask], axis=-1)
+        cross_mask = np.stack([cross_up_mask, cross_right_mask, cross_up_mask, cross_right_mask], axis=-1)
         cross_mask = torch.from_numpy(cross_mask).to(dtype=torch.bool)
 
         place_mask = self.field[..., Channels.Placed.value] == 0
@@ -264,6 +277,7 @@ class EndField:
         
         return (io_mask | cross_mask | place_mask).reshape(-1, 4)
 
+    @lru_cache()
     def get_spatial_power_mask(self) -> torch.Tensor:
         r, c = PowerSize
         mask = np.zeros((self.h, self.w), dtype=np.bool)
@@ -277,15 +291,20 @@ class EndField:
             colmask = self.field[..., Channels.Placed.value]
         else:
             colcum = self.field[..., Channels.Placed.value].cumsum(axis=1)
-            colmask = colcum[:, :-c+1] == colcum[c-1:]
-            colmask = np.logical_and(colmask, self.field[:, :-c+1: Channels.Placed.value])
+            colmask = colcum[:, :-c+1] == colcum[:, c-1:]
+            colmask = np.logical_and(colmask, self.field[:, :-c+1, Channels.Placed.value])
         mask[:self.h-r+1, :self.w-c+1] = np.logical_and(rowmask[:, :self.w-c+1], colmask[:self.h-r+1, :])
         return torch.from_numpy(mask).contiguous().to(dtype=torch.bool).flatten()
+    
+    def clean_cache(self):
+        self.get_spatial_belt_mask.cache_clear()
+        self.get_spatial_machine_mask.cache_clear()
+        self.get_spatial_power_mask.cache_clear()
 
     def get_states(self) -> Dict[str, Any]:
-        spatial_states = torch.tensor(self.field[..., Channels.Placed.value:]).to(dtype=torch.float32)
-        spatial_types = torch.tensor(self.field[..., Channels.MachineType.value])
-        spatial_ids = torch.tensor(self.field[..., Channels.MachineId.value]).to(dtype=torch.int32) + self.id_offset
+        spatial_states = torch.tensor(self.field[..., Channels.Placed.value:]).to(dtype=torch.float32).flatten(0, 1)
+        spatial_types = torch.tensor(self.field[..., Channels.MachineType.value]).flatten(0, 1)
+        spatial_ids = torch.tensor(self.field[..., Channels.MachineId.value]).to(dtype=torch.int32).flatten(0, 1) + self.id_offset
         graph_node_states = torch.tensor(self.nodes[..., NodeAttrs.Placed.value:]).to(dtype=torch.float32)
         graph_node_types = torch.tensor(self.nodes[..., NodeAttrs.MachineType.value])
         graph_node_ids = torch.tensor(self.nodes[..., NodeAttrs.Id.value]).to(dtype=torch.int32)
@@ -295,15 +314,15 @@ class EndField:
                 'types': spatial_types,
                 'ids': spatial_ids,
             },
-            'spatial_hw': torch.tensor((self.h, self.w), dtype=torch.int32),
+            'spatial_hw': torch.tensor(((self.h, self.w),), dtype=torch.int32),
             'graph_nodes': {
                 'states': graph_node_states,
                 'types': graph_node_types,
                 'ids': graph_node_ids,
             },
-            'edge_index': torch.tensor(self.edges),
+            'edge_index': torch.tensor(self.edges).transpose(0, 1),
             'edge_attrs': torch.tensor(self.edge_attrs),
-            'node_lengths': torch.tensor(self.nodes.shape[0]),
+            'node_lengths': torch.tensor((self.nodes.shape[0],)),
         }
     
     def check_finished(self) -> bool:
@@ -324,6 +343,7 @@ class EndField:
                         optional = True
             if not (required and optional):
                 return False
+        
         return True
     
     def check_dead(self) -> bool:
@@ -339,6 +359,10 @@ class EndField:
         if not self.get_spatial_belt_mask().any():
             return True
         return False
+
+    def put_machine_model(self, machine_id, idx):
+        pos, direction = idx // 4, idx % 4
+        return self.put_machine(machine_id, (pos // self.w, pos % self.w), direction)
 
     def put_machine(self, machine_id, position, direction):
         machine_type = self.nodes[machine_id, NodeAttrs.MachineType.value]
@@ -361,34 +385,28 @@ class EndField:
                 self.field[i, j, Channels.IsMachine.value] = 1
                 self.field[i, j, Channels.MachineType.value] = machine_type
                 self.field[i, j, Channels.MachineId.value] = machine_id
+                if self.field[i, j, Channels.Powered.value] == 1:
+                    if self.nodes[machine_id, NodeAttrs.Powered.value] != 1:
+                        reward += Rewards['machine_powered']
+                    self.nodes[machine_id, NodeAttrs.Powered.value] = 1
 
         # rotate clockwise 90 first
         if direction in [Directions.Right.value, Directions.Left.value]:
-            inputs = ((yy, c - xx) for xx, yy in inputs)
-            outputs = ((yy, c - xx) for xx, yy in outputs)
+            inputs = ((yy, c - xx - 1, (d+1)%4) for xx, yy, d in inputs)
+            outputs = ((yy, c - xx - 1, (d+1)%4) for xx, yy, d in outputs)
         # rotate 180 then
         if direction in [Directions.Down.value, Directions.Left.value]:
-            inputs = ((r - xx, c - yy) for xx, yy in inputs)
-            outputs = ((r - xx, c - yy) for xx, yy  in inputs)
-        for xx, yy, *port_direction in inputs:
+            inputs = ((r - xx - 1, c - yy - 1, (d+2)%4) for xx, yy, d in inputs)
+            outputs = ((r - xx - 1, c - yy - 1, (d+2)%4) for xx, yy, d in outputs)
+        for xx, yy, pd in inputs:
             self.field[x + xx, y + yy, Channels.InputPort.value] = 1
-            if len(port_direction) > 0:
-                pd = port_direction[0]
-            else:
-                pd = Directions.Up.value
-            pd = (pd + direction) % len(Directions)
             self.field[x + xx, y + yy, Channels.PortDirection.value] = pd
             if pd in [Directions.Up.value, Directions.Down.value]:
                 self.field[x + xx, y + yy, Channels.PortUp.value] = 1 if pd == Directions.Up.value else -1
             else:
                 self.field[x + xx, y + yy, Channels.PortRight.value] = 1 if pd == Directions.Right.value else -1
-        for xx, yy, *port_direction in outputs:
+        for xx, yy, pd in outputs:
             self.field[x + xx, y + yy, Channels.OutputPort.value] = 1
-            if len(port_direction) > 0:
-                pd = port_direction[0]
-            else:
-                pd = Directions.Up.value
-            pd = (pd + direction) % len(Directions)
             self.field[x + xx, y + yy, Channels.PortDirection.value] = pd
             if pd in [Directions.Up.value, Directions.Down.value]:
                 self.field[x + xx, y + yy, Channels.PortUp.value] = 1 if pd == Directions.Up.value else -1
@@ -397,14 +415,20 @@ class EndField:
 
         self.nodes[machine_id, NodeAttrs.Placed.value] = 1
         all_placed = self.nodes[:-2, NodeAttrs.Placed.value].all()
+        
+        self.minx = min(self.minx, x)
+        self.miny = min(self.miny, y)
+        self.maxx = max(self.maxx, x + r - 1)
+        self.maxy = max(self.maxy, y + c - 1)
         if all_placed:
             reward += Rewards['all_machine_placed']
         if self.check_finished():
-            reward += Rewards['finished']
+            reward += Rewards['finished'] * (1. - (self.maxx - self.minx + 1) * (self.maxy - self.miny + 1) / self.h / self.w)
             self._finished = True
         elif self.check_dead():
             reward += Rewards['dead_end']
             self._finished = True
+        self.clean_cache()
         return reward
     
     def _broadcast_connection(self, *position, direction=None):
@@ -458,6 +482,10 @@ class EndField:
                     return Rewards['unmatched']
             
             x, y, direction = xx, yy, dd
+    
+    def put_belt_model(self, idx):
+        pos, direction = idx // 4, idx % 4
+        return self.put_belt((pos // self.w, pos % self.w), direction)
     
     def put_belt(self, position, direction):
         updown = direction in [Directions.Up.value, Directions.Down.value]
@@ -562,14 +590,23 @@ class EndField:
         
         else:
             raise RuntimeError()
+
+        self.minx = min(self.minx, x)
+        self.miny = min(self.miny, y)
+        self.maxx = max(self.maxx, x)
+        self.maxy = max(self.maxy, y)
         
         if self.check_finished():
-            reward += Rewards['finished']
+            reward += Rewards['finished'] * (1. - (self.maxx - self.minx + 1) * (self.maxy - self.miny + 1) / self.h / self.w)
             self._finished = True
         elif self.check_dead():
             reward += Rewards['dead_end']
             self._finished = True
+        self.clean_cache()
         return reward
+
+    def put_power_model(self, pos):
+        return self.put_power((pos // self.w, pos % self.w))
 
     def put_power(self, position):
         x, y = position
@@ -600,14 +637,83 @@ class EndField:
                     if not self.nodes[machine_id, NodeAttrs.Powered.value]:
                         reward += Rewards['machine_powered']
                     self.nodes[machine_id, NodeAttrs.Powered.value] = 1
+                    
+        self.minx = min(self.minx, x)
+        self.miny = min(self.miny, y)
+        self.maxx = max(self.maxx, x + PowerSize[0] - 1)
+        self.maxy = max(self.maxy, y + PowerSize[1] - 1)
         if self.check_finished():
-            reward += Rewards['finished']
+            reward += Rewards['finished'] * (1. - (self.maxx - self.minx + 1) * (self.maxy - self.miny + 1) / self.h / self.w)
             self._finished = True
         elif self.check_dead():
             reward += Rewards['dead_end']
             self._finished = True
+        self.clean_cache()
         return reward
         
+    def render(self, block=True):
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        plt.figure(figsize=(10, 10))
+        plt.xlim(0, self.w)
+        plt.ylim(0, self.h)
+        plt.gca().invert_yaxis()
+        plt.grid(True, color='gray', linewidth=0.5)
+        
+        for i in range(self.h):
+            for j in range(self.w):
+                if self.field[i, j, Channels.IsMachine.value] == 1:
+                    rect = patches.Rectangle((j, i), 1, 1, linewidth=1, edgecolor='none',
+                                             facecolor='black' if self.field[i, j, Channels.Powered.value] == 0 else 'midnightblue')
+                    plt.gca().add_patch(rect)
+                    if self.field[i, j, Channels.InputPort.value] == 1:
+                        if self.field[i, j, Channels.PortUp.value] == 1:
+                            plt.gca().add_patch(patches.Arrow(j+0.5, i+0.5, 0, -0.5, color='wheat'))
+                        if self.field[i, j, Channels.PortUp.value] == -1:
+                            plt.gca().add_patch(patches.Arrow(j+0.5, i+0.5, 0, 0.5, color='wheat'))
+                        if self.field[i, j, Channels.PortRight.value] == 1:
+                            plt.gca().add_patch(patches.Arrow(j+0.5, i+0.5, 0.5, 0, color='wheat'))
+                        if self.field[i, j, Channels.PortRight.value] == -1:
+                            plt.gca().add_patch(patches.Arrow(j+0.5, i+0.5, -0.5, 0, color='wheat'))
+                    if self.field[i, j, Channels.OutputPort.value] == 1:
+                        if self.field[i, j, Channels.PortUp.value] == 1:
+                            plt.gca().add_patch(patches.Arrow(j+0.5, i+0.5, 0, -0.5, color='lightgreen'))
+                        if self.field[i, j, Channels.PortUp.value] == -1:
+                            plt.gca().add_patch(patches.Arrow(j+0.5, i+0.5, 0, 0.5, color='lightgreen'))
+                        if self.field[i, j, Channels.PortRight.value] == 1:
+                            plt.gca().add_patch(patches.Arrow(j+0.5, i+0.5, 0.5, 0, color='lightgreen'))
+                        if self.field[i, j, Channels.PortRight.value] == -1:
+                            plt.gca().add_patch(patches.Arrow(j+0.5, i+0.5, -0.5, 0, color='lightgreen'))
+                elif self.field[i, j, Channels.IsBelt.value] == 1:
+                    rect = patches.Rectangle((j, i), 1, 1, linewidth=1, edgecolor='none',
+                                             facecolor='darkorange')
+                    plt.gca().add_patch(rect)
+                    if self.field[i, j, Channels.BeltUp.value] == 1:
+                        plt.gca().add_patch(patches.Arrow(j+0.5, i+0.5, 0, -0.5, color='gold'))
+                    if self.field[i, j, Channels.BeltUp.value] == -1:
+                        plt.gca().add_patch(patches.Arrow(j+0.5, i+0.5, 0, 0.5, color='gold'))
+                    if self.field[i, j, Channels.BeltRight.value] == 1:
+                        plt.gca().add_patch(patches.Arrow(j+0.5, i+0.5, 0.5, 0, color='gold'))
+                    if self.field[i, j, Channels.BeltRight.value] == -1:
+                        plt.gca().add_patch(patches.Arrow(j+0.5, i+0.5, -0.5, 0, color='gold'))
+                elif self.field[i, j, Channels.IsPower.value] == 1:
+                    rect = patches.Rectangle((j, i), 1, 1, linewidth=1, edgecolor='none',
+                                             facecolor='blue')
+                    plt.gca().add_patch(rect)
+        plt.show(block=block)
 
 def generate_new_game(level: int) -> EndField:
-    return
+    nodes = [GraphNode(MachineType=12), GraphNode(MachineType=12), GraphNode(MachineType=11)] + [GraphNode(MachineType=random.randint(0, 4)) for _ in range(3)]
+    edges = [GraphEdge(0, 3, 1), GraphEdge(1, 4, 1), GraphEdge(3, 5, 1), GraphEdge(4, 5, 1), GraphEdge(5, 2, 1)]
+    graph = Graph(nodes, edges)
+    game = EndField(h=8, w=10, expect_graph=graph)
+    return game
+
+if __name__ == '__main__':
+    game = generate_new_game(0)
+    game.put_power((0, 0))
+    game.put_machine(0, (0, 2), 2)
+    game.put_belt((1, 3), 2)
+    game.put_belt((2, 3), 1)
+    game.put_belt((2, 3), 2)
+    game.render()
