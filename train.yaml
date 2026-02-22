@@ -1,12 +1,12 @@
 device: cuda
-num_iterations: 100000
+num_iterations: 1000
 buffer_size: 1024
 # buffer_size: 100
-batch_size: 64
+batch_size: 32
 update_epochs: 4
 gamma: 0.99
 gae_lambda: 0.95
-lr: 1e-4
+lr: 1e-5
 weight_decay: 1e-4
 normalize_advantages: true
 clip_range: 0.2
@@ -14,4 +14,5 @@ value_coef: 0.5
 entropy_coef: 0.01
 max_grad_norm: 0.5
 save_epochs: 100
-eval_epochs: 10
+eval_size: 10
+save_dir: ./eval

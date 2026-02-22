@@ -9,7 +9,7 @@ from torch.distributions import Categorical
 
 from configuration import EFLayoutConfig
 from modeling import EFLayoutModelBackbone, EFLayoutActorCritic
-from game import generate_new_game
+from game import generate_new_game, get_max_level
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -44,6 +44,8 @@ def main():
     
     print(model_backbone)
     print(model_ac)
+    current_level = 0
+    torch.autograd.set_detect_anomaly(True)
     
     optimizer = torch.optim.AdamW(
         list(model_backbone.parameters()) + list(model_ac.parameters()),
@@ -51,7 +53,9 @@ def main():
         weight_decay=float(train_config["weight_decay"])
     )
     
-    for iteration in tqdm.trange(1, train_config["num_iterations"] + 1, desc='Iterations', leave=True, unit='iter'):
+    eval_rewards = []
+    iter_bar = tqdm.trange(1, train_config["num_iterations"] + 1, desc='Iterations', leave=True, unit='iter')
+    for iteration in iter_bar:
         states = []
         rewards = []
         dones = []
@@ -64,7 +68,7 @@ def main():
         bar = tqdm.tqdm(desc='Collecting samples', leave=False, total=train_config["buffer_size"], unit='samples')
         with torch.no_grad():
             while len(states) < train_config["buffer_size"]:
-                env = generate_new_game(0)
+                env = generate_new_game(current_level)
                 done = False
                 while not done and len(states) < train_config["buffer_size"]:
                     state = env.get_states()
@@ -168,18 +172,20 @@ def main():
                 delta = rewards[t] + train_config["gamma"] * nextnonterminal * nextvalues - values[t]
                 advantages[t] = lastgaelam = delta + nextnonterminal * lastgaelam * train_config["gamma"] * train_config["gae_lambda"]
             returns = advantages + values
+        if train_config['normalize_advantages']:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         for epoch in tqdm.trange(train_config["update_epochs"], desc='Updating', leave=False, unit='epochs'):
             indices = np.arange(len(rewards))
             np.random.shuffle(indices)
 
-            bar = tqdm.trange(
+            ebar = tqdm.trange(
                 0, len(rewards), train_config["batch_size"],
                 desc='Batches',
                 leave=False,
                 unit='batches'
             )
-            for start in bar:
+            for start in ebar:
                 end = start + train_config["batch_size"]
                 batch_indices = indices[start:end]
                 
@@ -227,7 +233,6 @@ def main():
                     if len(v["buffer"]) == 0:
                         continue
                     bstate = collate([states[idx] for idx in v["buffer"]])
-                    tmp = [masks[idx].shape for idx in v["buffer"]]
                     bmask = collate([masks[idx] for idx in v["buffer"]])
                     bb = model_backbone(**bstate)
                     kwargs = v["extra_kwargs"](bmask, [actions[idx] for idx in v["buffer"]])
@@ -236,15 +241,17 @@ def main():
                     new_ratios = []
                     entropy = 0.
                     for idx, logits in zip(v["buffer"], logits_list):
-                        cate = Categorical(logits=logits)
+                        try:
+                            cate = Categorical(logits=logits)
+                        except:
+                            print(f'idx={idx}, logits={logits} mask={masks[idx]} k={k}')
+                            continue
                         logratio = cate.log_prob(actions[idx][-1]) - logprobs[idx]
+                        logratio = logratio.clamp(-5, 5)
                         new_ratios.append(logratio.exp())
                         entropy += cate.entropy()
                     new_ratios = torch.stack(new_ratios, dim=0)
                     advs = advantages[v["buffer"]]
-                    
-                    if train_config['normalize_advantages']:
-                        advs = (advs - advs.mean()) / (advs.std() + 1e-8)
                     
                     pg_loss1 = -new_ratios * advs
                     pg_loss2 = -new_ratios.clamp(1.-train_config['clip_range'], 1.+train_config['clip_range']) * advs
@@ -261,13 +268,83 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model_backbone.parameters(), train_config['max_grad_norm'])
                 
                 avgloss = sumloss / len(indices)
-                bar.set_postfix({'loss': avgloss}, refresh=False)
+                ebar.set_postfix({'loss': avgloss}, refresh=False)
                 
                 optimizer.step()
+        
+        torch.cuda.empty_cache()
 
-        if epoch % train_config['save_epochs'] == 0:
-            torch.save(model_ac.state_dict(), f'{train_config["save_dir"]}/model_ac_{epoch}.pt')
-            torch.save(model_backbone.state_dict(), f'{train_config["save_dir"]}/model_backbone_{epoch}.pt')
+        if iteration % train_config['save_epochs'] == 0:
+            torch.save(model_ac.state_dict(), f'{train_config["save_dir"]}/model_ac_{iteration}.pt')
+            torch.save(model_backbone.state_dict(), f'{train_config["save_dir"]}/model_backbone_{iteration}.pt')
+            extra_info = {
+                "current_level": current_level,
+                "iteration": iteration,
+                "optimizer_state_dict": optimizer.state_dict(),
+            }
+            torch.save(extra_info, f'{train_config["save_dir"]}/extra_info_{iteration}.pt')
+        
+        eval_rewards_tmp = []
+        for eval_idx in range(train_config['eval_size']):
+            env = generate_new_game(current_level)
+            done = False
+            sum_reward = 0.
+            while not done:
+                state = env.get_states()
+                state = move_to_device(state, device)
+                
+                bb = model_backbone(**state)
+                critic = model_ac.get_critic(**bb)
+                
+                action_mask = env.get_action_mask()
+                action_logits, _ = model_ac.get_action(**bb, action_mask=action_mask)
+                action_cate = Categorical(logits=action_logits)
+                action = action_cate.sample()
+                
+                if action == 0:
+                    machine_mask = env.get_machine_mask()
+                    machine_logits, _ = model_ac.get_machine(**bb, machine_mask=machine_mask)
+                    machine_cate = Categorical(logits=machine_logits)
+                    machine = machine_cate.sample()
+                    
+                    spatial_machine_mask = env.get_spatial_machine_mask(machine.item())
+                    lo_logits, _ = model_ac.get_location_orientation(
+                        **bb,
+                        selected=machine.unsqueeze(0),
+                        spatial_machine_mask=spatial_machine_mask
+                    )
+                    lo_cate = Categorical(logits=lo_logits)
+                    lo = lo_cate.sample()
+
+                    reward = env.put_machine_model(machine.item(), lo.item())
+                elif action == 1:
+                    belt_mask = env.get_spatial_belt_mask()
+                    belt_logits, _ = model_ac.get_belt_location_orientation(**bb, spatial_belt_mask=belt_mask)
+                    belt_cate = Categorical(logits=belt_logits)
+                    belt = belt_cate.sample()
+                    
+                    reward = env.put_belt_model(belt.item())
+                elif action == 2:
+                    power_mask = env.get_spatial_power_mask()
+                    power_logits, _ = model_ac.get_power_location(**bb, spatial_power_mask=power_mask)
+                    power_cate = Categorical(logits=power_logits)
+                    power = power_cate.sample()
+                    
+                    reward = env.put_power_model(power.item())
+                else:
+                    raise RuntimeError(f"Unknown action {action}")
+                
+                done = env.finished
+                sum_reward += reward
+                # print(f'{action=}, {reward=}, {done=}, {str(env)}', flush=True)
+            env.render(file=f'{train_config["save_dir"]}/eval_{iteration}_{eval_idx}.png')
+            
+            eval_rewards_tmp.append(sum_reward)
+        eval_rewards.append(sum(eval_rewards_tmp) / len(eval_rewards_tmp))
+        iter_bar.set_postfix({'eval_reward': eval_rewards[-1], 'current_level': current_level}, refresh=False)
+        if len(eval_rewards) > 10 and eval_rewards[-1] < max(eval_rewards[-10:]) and min(eval_rewards[-10:]) > 10 and current_level < get_max_level():
+            current_level += 1
+            eval_rewards = []
             
 if __name__ == '__main__':
     main()

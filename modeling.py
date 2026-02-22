@@ -462,7 +462,7 @@ class EFLayoutActorCritic(nn.Module):
         all_logits = []
         slen = spatial_hw.prod(-1).tolist()
         for q, k, mask in zip(
-            pq.unsqueeze(-2),
+            pq,
             pk.split(slen),
             spatial_power_mask.split(slen)
         ):
